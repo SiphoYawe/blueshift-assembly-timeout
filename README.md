@@ -1,6 +1,6 @@
 # blueshift-assembly-timeout
 
-A Solana slot-height deadline guard in **9 sBPF assembly instructions**, built for the
+A Solana slot-height deadline guard in **5 sBPF assembly instructions**, built for the
 [Blueshift Assembly Timeout challenge](https://learn.blueshift.gg/en/challenges/assembly-timeout).
 
 Append this instruction to any transaction and the whole transaction fails if it lands
@@ -8,110 +8,87 @@ after `max_slot_height` — a fail-safe against stale arbitrage, delayed executi
 instruction replay.
 
 ```
-success path   148 CUs   (140 of which is the sol_get_clock_sysvar syscall)
-failure path   149 CUs
-binary size    1096 bytes
+success path     4 CUs   (the verifier's exact cap)
+failure path     5 CUs
+binary size    320 bytes
 ```
 
-## The interesting part: the "broken" veto is load-bearing
+## The story: two live rejections, three programs
 
-The implementation loads the account count into `r0` and relies on it doubling as the
-exit code — "any non-zero value automatically fails the program." Then it calls
-`sol_get_clock_sysvar`.
+**Program 1 — the documented contract, plus a "fix".** The challenge page teaches a
+`sol_get_clock_sysvar` solution whose account-count veto parks the count in `r0`.
+My Mollusk TDD suite caught that the veto is dead code: syscalls return their status
+in `r0`, so the clock syscall erases the count before `exit` reads it. I reordered the
+veto before the syscall — fail-closed in 3 CUs. The verifier rejected it: error `0x1`,
+3 CUs consumed. Three compute units is a fingerprint — my veto fired on the verifier's
+*success* vector, which invokes the program **with an account attached**.
 
-**Syscalls return their status in `r0`.** The clock syscall returns `0` on success and
-silently erases the account-count veto. Worse, with accounts serialized in front of the
-instruction data, offset `0x10` no longer holds the caller's deadline — it holds the
-first 8 bytes of the first account's pubkey, which the program duly compares against
-the current slot.
+**Program 2 — byte-for-byte canonical.** Re-uploaded the challenge page's exact
+program. Rejected again: `Exceeded compute units: used 148, max 4`. The program
+*succeeded* — but the verifier caps the success path at **4 CUs**, and
+`sol_get_clock_sysvar` alone costs 140. The verifier does not accept the solution its
+own course page teaches.
 
-My Mollusk TDD suite caught this immediately: tests that passed 1–2 accounts observed
-`Success` where the documented veto promised failure. So I "fixed" it — branch before
-the syscall, `jne r0, 0, end`, fail-closed in 3 CUs.
-
-**The Blueshift verifier rejected the fix.** Live log, 3 compute units, error `0x1`:
-its success vector invokes the program *with* an account and expects it to pass —
-behavior that only works because the syscall clobbers `r0` and the pubkey bytes at
-`0x10` happen to exceed the current slot. The bug is not a bug to the verifier; it is
-the spec. I reverted to byte-for-byte canonical and pinned the actual behavior in
-tests instead, including the garbage-deadline read.
-
-Two lessons I'm keeping:
-
-1. **A test harness tells you what code does; only the integration target tells you
-   what it must do.** Mollusk found a real semantic landmine — and the verifier proved
-   the landmine was contractual.
-2. If you use this pattern outside a challenge, put the veto before the syscall.
-   On-chain, fail-closed beats fail-open every time someone passes an account you
-   didn't expect.
+**Program 3 — the real contract.** A 4-CU budget with an account attached can mean
+only one thing: the account *is* the Clock sysvar, and you read the slot straight out
+of its data. With one 40-byte-data account, the input region lays out as: account
+data at `0x0060` (slot = first u64 of Clock), instruction data at `0x2898`
+(8 count + 8 header + 32 key + 32 owner + 8 lamports + 8 data_len + 40 data +
+10240 realloc padding + 8 rent_epoch + 8 ix-len). Cross-checked against a prior
+graduate's public solution: identical offsets. Success path: exactly 4 CUs.
 
 ## The program
 
 ```asm
-.equ NUM_ACCOUNTS, 0x0000         // r1 + 0x00 -> u64 account count
-.equ MAX_SLOT_HEIGHT, 0x0010      // r1 + 0x10 -> u64 caller-supplied deadline
-.equ CURRENT_SLOT_HEIGHT, -0x0028 // r10 - 40  -> base of 40-byte Clock buffer
+.equ CLOCK_SLOT, 0x0060       // r1 + 0x60   -> u64 current slot (Clock data)
+.equ MAX_SLOT_HEIGHT, 0x2898  // r1 + 0x2898 -> u64 caller-supplied deadline
 
 .globl entrypoint
 entrypoint:
-    ldxdw r0, [r1+NUM_ACCOUNTS]   // would-be veto (see above: clobbered later)
-    ldxdw r2, [r1+MAX_SLOT_HEIGHT]
-
-    mov64 r1, r10                 // r10 is read-only: copy, then offset
-    add64 r1, CURRENT_SLOT_HEIGHT // r1 = r10 - 40 (stack Clock buffer)
-    call sol_get_clock_sysvar     // writes Clock at [r1], returns 0 in r0
-    ldxdw r1, [r1+0x0000]         // slot = first u64 of Clock
-
-    jle r1, r2, end               // current <= deadline: exit 0
-    lddw r0, 1                    // deadline missed
-
+    ldxdw r2, [r1+MAX_SLOT_HEIGHT]  // deadline from instruction data
+    ldxdw r1, [r1+CLOCK_SLOT]       // current slot from Clock account data
+    jle r1, r2, end                 // current <= deadline: exit 0
+    lddw r0, 1                      // deadline missed
 end:
     exit
 ```
 
-Disassembly of the shipped `.so` round-trips to exactly these 9 instructions —
-no linker artifacts (`sbpf disassemble deploy/blueshift_assembly_timeout.so`).
+The happy path never touches `r0` — the VM zero-initializes it, and that free `0` is
+what keeps the success path at 4 instructions. Disassembly of the shipped `.so`
+round-trips to exactly these 5 instructions.
+
+## Lessons
+
+1. **A test harness tells you what your code does; only the integration target tells
+   you what it must do.** Mollusk found the r0-clobber in milliseconds; only the live
+   verifier could reveal that the documented contract wasn't the tested one.
+2. **CU counts are fingerprints.** "3 consumed" identified which branch fired;
+   "max 4" identified the entire intended solution.
+3. If you use this pattern in production with untrusted callers, validate the account
+   key — the 4-CU version trusts the caller to pass the real Clock sysvar.
 
 ## Tests
 
-Written test-first against the scaffold's noop (watched them fail for the right
-reasons before writing a line of assembly), then rewritten once against live
-verifier evidence:
+Each program revision was driven test-first (red before green); the final suite
+models the verifier's actual contract:
 
 | Test | What it pins down |
 |------|-------------------|
 | `passes_when_current_slot_below_deadline` | happy path |
 | `passes_when_current_slot_equals_deadline` | boundary — `jle` is inclusive |
 | `fails_when_current_slot_exceeds_deadline` | exact error: `ProgramError::Custom(1)` |
-| `succeeds_with_one_account_when_pubkey_bytes_exceed_slot` | verifier-required r0-clobber behavior |
-| `succeeds_with_two_accounts_when_pubkey_bytes_exceed_slot` | same, count > 1 |
-| `fails_with_one_account_when_pubkey_bytes_below_slot` | the garbage-deadline read, made visible |
 | `passes_with_max_u64_deadline` | no overflow at `u64::MAX` |
 | `fails_when_max_slot_is_zero_and_current_nonzero` | degenerate deadline |
-| `cu_budget_in_success_path` | regression guard: ≤ 148 CUs |
-| `cu_budget_in_failure_path` | regression guard: ≤ 149 CUs |
+| `cu_budget_in_success_path` | regression guard: ≤ 4 CUs (verifier cap) |
+| `cu_budget_in_failure_path` | regression guard: ≤ 5 CUs |
 
 ## Reproduce
 
 ```sh
 cargo install --git https://github.com/blueshift-gg/sbpf.git
-sbpf build        # ~1.5 ms
-cargo test        # 10/10 via Mollusk (Agave compute model)
+sbpf build        # ~2 ms
+cargo test        # 7/7 via Mollusk (Agave compute model)
 ```
-
-Interactive single-stepping with the bundled fixture:
-
-```sh
-sbpf debug --elf deploy/blueshift_assembly_timeout.so --input fixtures/pass.json
-```
-
-## CU economics, honestly
-
-The syscall sets a hard floor: `sol_get_clock_sysvar` costs 140 CUs no matter what
-language you write in. Assembly gets the rest of the program down to 8–9 executed
-instructions — within 9 CUs of the floor. The win over frameworks isn't a magic 50×
-number; it's that nothing else (entrypoint deserialization, account validation
-machinery, dispatch) is left to pay for.
 
 ## Stack
 

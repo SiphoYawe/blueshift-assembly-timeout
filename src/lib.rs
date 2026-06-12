@@ -11,10 +11,16 @@ mod tests {
 
     const ELF_PATH: &str = "deploy/blueshift_assembly_timeout";
 
-    // Measured via Mollusk (Agave compute model). The sol_get_clock_sysvar
-    // syscall dominates at ~140 CUs; the program's own instructions add ~9.
-    const SUCCESS_CU_BUDGET: u64 = 148;
-    const FAILURE_CU_BUDGET: u64 = 149;
+    // The live Blueshift verifier enforces these (observed: "Exceeded compute
+    // units: used 148, max 4"). The syscall solution from the challenge page
+    // (140 CUs for sol_get_clock_sysvar alone) cannot pass; the verifier
+    // passes the Clock sysvar as account #1 and expects a direct read of its
+    // data: slot at input offset 0x0060, instruction data at 0x2898.
+    const SUCCESS_CU_BUDGET: u64 = 4;
+    const FAILURE_CU_BUDGET: u64 = 5;
+
+    const CLOCK_SYSVAR_ID: &str = "SysvarC1ock11111111111111111111111111111111";
+    const SYSVAR_OWNER_ID: &str = "Sysvar1111111111111111111111111111111111111";
 
     fn program_id() -> Address {
         Address::new_from_array([0x42; 32])
@@ -26,37 +32,71 @@ mod tests {
         mollusk
     }
 
-    fn timeout_ix(max_slot: u64, accounts: Vec<AccountMeta>) -> Instruction {
-        Instruction::new_with_bytes(program_id(), &max_slot.to_le_bytes(), accounts)
+    fn clock_id() -> Address {
+        CLOCK_SYSVAR_ID.parse().unwrap()
     }
 
-    fn dummy_account() -> Account {
-        Account {
-            lamports: 1_000_000,
-            ..Default::default()
-        }
+    // 40-byte bincode layout: slot, epoch_start_timestamp, epoch,
+    // leader_schedule_epoch, unix_timestamp — all 8-byte LE.
+    fn clock_account(mollusk: &Mollusk) -> (Address, Account) {
+        let clock = &mollusk.sysvars.clock;
+        let mut data = Vec::with_capacity(40);
+        data.extend_from_slice(&clock.slot.to_le_bytes());
+        data.extend_from_slice(&clock.epoch_start_timestamp.to_le_bytes());
+        data.extend_from_slice(&clock.epoch.to_le_bytes());
+        data.extend_from_slice(&clock.leader_schedule_epoch.to_le_bytes());
+        data.extend_from_slice(&clock.unix_timestamp.to_le_bytes());
+        (
+            clock_id(),
+            Account {
+                lamports: 1_000_000,
+                data,
+                owner: SYSVAR_OWNER_ID.parse().unwrap(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+    }
+
+    fn timeout_ix(max_slot: u64) -> Instruction {
+        Instruction::new_with_bytes(
+            program_id(),
+            &max_slot.to_le_bytes(),
+            vec![AccountMeta::new_readonly(clock_id(), false)],
+        )
+    }
+
+    fn run(current_slot: u64, max_slot: u64) -> mollusk_svm::result::InstructionResult {
+        let mollusk = setup(current_slot);
+        let accounts = [clock_account(&mollusk)];
+        mollusk.process_instruction(&timeout_ix(max_slot), &accounts)
     }
 
     #[test]
     fn passes_when_current_slot_below_deadline() {
         let mollusk = setup(100);
-        let ix = timeout_ix(1_000, vec![]);
-        mollusk.process_and_validate_instruction(&ix, &[], &[Check::success()]);
+        let accounts = [clock_account(&mollusk)];
+        mollusk.process_and_validate_instruction(
+            &timeout_ix(1_000),
+            &accounts,
+            &[Check::success()],
+        );
     }
 
     #[test]
     fn passes_when_current_slot_equals_deadline() {
         // Boundary: jle is inclusive, so slot == deadline must succeed.
-        let mollusk = setup(500);
-        let ix = timeout_ix(500, vec![]);
-        mollusk.process_and_validate_instruction(&ix, &[], &[Check::success()]);
+        let result = run(500, 500);
+        assert!(
+            !result.program_result.is_err(),
+            "slot == deadline must succeed, got {:?}",
+            result.program_result
+        );
     }
 
     #[test]
     fn fails_when_current_slot_exceeds_deadline() {
-        let mollusk = setup(1_001);
-        let ix = timeout_ix(1_000, vec![]);
-        let result = mollusk.process_instruction(&ix, &[]);
+        let result = run(1_001, 1_000);
         assert_eq!(
             result.program_result,
             ProgramResult::Failure(ProgramError::Custom(1)),
@@ -64,81 +104,19 @@ mod tests {
         );
     }
 
-    // The Blueshift verifier invokes the program WITH an account and expects
-    // success (observed live: a 3-CU veto exit with code 0x1 was rejected).
-    // The canonical "account veto" is therefore dead code by design:
-    // sol_get_clock_sysvar returns its status in r0, erasing the count, and
-    // with accounts serialized in front, offset 0x10 holds the first 8 bytes
-    // of the first account's pubkey — not the caller's deadline. These tests
-    // pin that bug-for-bug behavior, because it is what the verifier demands.
-
-    #[test]
-    fn succeeds_with_one_account_when_pubkey_bytes_exceed_slot() {
-        let mollusk = setup(100);
-        // First 8 bytes of the pubkey land at 0x10 and act as the "deadline":
-        // 0xFFFF_FFFF_FFFF_FFFF >= any slot, so the program must succeed.
-        let key = Address::new_from_array([0xff; 32]);
-        let ix = timeout_ix(1_000, vec![AccountMeta::new_readonly(key, false)]);
-        let result = mollusk.process_instruction(&ix, &[(key, dummy_account())]);
-        assert!(
-            !result.program_result.is_err(),
-            "verifier-compatible behavior: account passed must NOT trip a veto, got {:?}",
-            result.program_result
-        );
-    }
-
-    #[test]
-    fn succeeds_with_two_accounts_when_pubkey_bytes_exceed_slot() {
-        let mollusk = setup(100);
-        let key_a = Address::new_from_array([0xff; 32]);
-        let key_b = Address::new_from_array([0x02; 32]);
-        let ix = timeout_ix(
-            1_000,
-            vec![
-                AccountMeta::new_readonly(key_a, false),
-                AccountMeta::new_readonly(key_b, false),
-            ],
-        );
-        let result = mollusk.process_instruction(
-            &ix,
-            &[(key_a, dummy_account()), (key_b, dummy_account())],
-        );
-        assert!(
-            !result.program_result.is_err(),
-            "verifier-compatible behavior: accounts passed must NOT trip a veto, got {:?}",
-            result.program_result
-        );
-    }
-
-    #[test]
-    fn fails_with_one_account_when_pubkey_bytes_below_slot() {
-        // Documents the garbage-read: a pubkey whose first 8 bytes decode to 0
-        // becomes a deadline of slot 0, so any nonzero slot fails with code 1.
-        let mollusk = setup(100);
-        let mut key_bytes = [0u8; 32];
-        key_bytes[8..].fill(0x33);
-        let key = Address::new_from_array(key_bytes);
-        let ix = timeout_ix(1_000, vec![AccountMeta::new_readonly(key, false)]);
-        let result = mollusk.process_instruction(&ix, &[(key, dummy_account())]);
-        assert_eq!(
-            result.program_result,
-            ProgramResult::Failure(ProgramError::Custom(1)),
-            "low pubkey bytes read as an expired deadline"
-        );
-    }
-
     #[test]
     fn passes_with_max_u64_deadline() {
-        let mollusk = setup(999_999_999);
-        let ix = timeout_ix(u64::MAX, vec![]);
-        mollusk.process_and_validate_instruction(&ix, &[], &[Check::success()]);
+        let result = run(999_999_999, u64::MAX);
+        assert!(
+            !result.program_result.is_err(),
+            "u64::MAX deadline must always succeed, got {:?}",
+            result.program_result
+        );
     }
 
     #[test]
     fn fails_when_max_slot_is_zero_and_current_nonzero() {
-        let mollusk = setup(1);
-        let ix = timeout_ix(0, vec![]);
-        let result = mollusk.process_instruction(&ix, &[]);
+        let result = run(1, 0);
         assert_eq!(
             result.program_result,
             ProgramResult::Failure(ProgramError::Custom(1)),
@@ -148,13 +126,11 @@ mod tests {
 
     #[test]
     fn cu_budget_in_success_path() {
-        let mollusk = setup(100);
-        let ix = timeout_ix(1_000, vec![]);
-        let result = mollusk.process_instruction(&ix, &[]);
+        let result = run(100, 1_000);
         assert!(!result.program_result.is_err());
         assert!(
             result.compute_units_consumed <= SUCCESS_CU_BUDGET,
-            "success path consumed {} CUs, budget is {}",
+            "success path consumed {} CUs, verifier max is {}",
             result.compute_units_consumed,
             SUCCESS_CU_BUDGET
         );
@@ -162,9 +138,7 @@ mod tests {
 
     #[test]
     fn cu_budget_in_failure_path() {
-        let mollusk = setup(1_001);
-        let ix = timeout_ix(1_000, vec![]);
-        let result = mollusk.process_instruction(&ix, &[]);
+        let result = run(1_001, 1_000);
         assert!(result.program_result.is_err());
         assert!(
             result.compute_units_consumed <= FAILURE_CU_BUDGET,

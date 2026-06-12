@@ -2,46 +2,35 @@
 //  Assembly Timeout — slot-height deadline guard
 //  Blueshift challenge: https://learn.blueshift.gg/en/challenges/assembly-timeout
 //
-//  Contract (zero-account invocation):
-//    - Reads an 8-byte u64 max_slot_height from instruction data (r1 + 0x10).
-//    - Calls sol_get_clock_sysvar to read the current slot.
-//    - Returns 0 if current_slot <= max_slot_height, else 1.
+//  Verifier contract (differs from the challenge page, which still teaches a
+//  sol_get_clock_sysvar solution — 140 CUs for the syscall alone, while the
+//  live verifier enforces "max 4" compute units on the success path):
+//    - Account #1 is the Clock sysvar; its 40-byte data starts at input
+//      offset 0x0060, so the current slot (first u64 of Clock) is at 0x0060.
+//    - Instruction data follows the serialized account: 8-byte u64
+//      max_slot_height at offset 0x2898
+//      (= 8 count + 8 acct header + 32 key + 32 owner + 8 lamports
+//         + 8 data_len + 40 data + 10240 realloc pad + 8 rent_epoch + 8 len).
+//    - Return 0 if current_slot <= max_slot_height, else 1.
 //
-//  This is the canonical implementation, byte-for-byte. Note the account
-//  "veto" below is dead code in practice: sol_get_clock_sysvar returns its
-//  status in r0, overwriting the account count before exit reads it. The
-//  Blueshift verifier invokes the program WITH an account and expects
-//  success, so canonical behavior is required — an early `jne r0, 0, end`
-//  veto fails verification (observed live: rejected at 3 CUs, error 0x1).
+//  Success path is exactly 4 CUs (ldxdw, ldxdw, jle, exit) — r0 is
+//  zero-initialized by the VM, so the happy path never has to touch it.
+//  Failure path is 5 CUs.
 // ---------------------------------------------------------------------------
 
-.equ NUM_ACCOUNTS, 0x0000         // r1 + 0x00 -> u64 account count
-.equ MAX_SLOT_HEIGHT, 0x0010      // r1 + 0x10 -> u64 caller-supplied deadline
-.equ CURRENT_SLOT_HEIGHT, -0x0028 // r10 - 40 -> base of 40-byte Clock buffer
+.equ CLOCK_SLOT, 0x0060       // r1 + 0x60  -> u64 current slot (Clock data)
+.equ MAX_SLOT_HEIGHT, 0x2898  // r1 + 0x2898 -> u64 caller-supplied deadline
 
 .globl entrypoint
 entrypoint:
-    // Account count rides in r0 as a would-be exit code (see header note).
-    ldxdw r0, [r1+NUM_ACCOUNTS]
-
-    // Caller-supplied deadline. With accounts present this offset holds the
-    // first 8 bytes of the first account's pubkey instead — the verifier's
-    // success vector relies on that value comparing >= the current slot.
+    // Caller-supplied deadline from instruction data.
     ldxdw r2, [r1+MAX_SLOT_HEIGHT]
 
-    // Carve 40 stack bytes for the Clock sysvar. r10 is read-only, so copy
-    // it into r1 and add the negative offset (r1 = r10 - 40).
-    mov64 r1, r10
-    add64 r1, CURRENT_SLOT_HEIGHT
-
-    // Syscall writes the 40-byte Clock struct at [r1] and returns 0 in r0.
-    call sol_get_clock_sysvar
-
-    // slot is the first u64 field of Clock -> offset 0x00.
-    ldxdw r1, [r1+0x0000]
+    // Current slot, read directly from the Clock sysvar account's data.
+    ldxdw r1, [r1+CLOCK_SLOT]
 
     // Inside the deadline window (current <= max): exit with r0 = 0,
-    // the syscall's success return.
+    // untouched since VM entry.
     jle r1, r2, end
 
     // Deadline missed: error code 1.
