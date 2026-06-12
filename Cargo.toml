@@ -1,0 +1,16 @@
+[package]
+name = "blueshift_assembly_timeout"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[dev-dependencies]
+mollusk-svm = "0.7.2"
+solana-instruction = "3.1.0"
+solana-address = "2.0.0"
+solana-account = "3"
+solana-program-error = "3"
+
+[features]
+test-sbf = []
